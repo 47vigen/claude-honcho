@@ -4,7 +4,7 @@
  * Only hooks that output JSON with `systemMessage` show inline indicators in Claude Code:
  * - UserPromptSubmit — addSystemMessage() adds to existing JSON output
  * - PostToolUse — visCapture() outputs JSON with systemMessage
- * - Stop — visStopMessage() outputs JSON with systemMessage
+ * - Stop — visStopMessage() outputs JSON with systemMessage, on a failed upload only
  *
  * SessionStart, SessionEnd, and PreCompact output plain text to stdout (context injection),
  * so they cannot show inline indicators. Their activity is logged to the verbose log file only.
@@ -51,16 +51,19 @@ export function visMessage(direction: HookDirection, hookName: string, message: 
 
 /**
  * Build the injection systemMessage for the user-prompt hook: a one-line status
- * summary followed by the injected conclusions as bullets. The stable profile
- * block is intentionally omitted here — it lives in the injection log, not in
- * every turn's transcript. `matched` is only set for high-signal topics, so a
- * low-signal fuzzy fallback query is never surfaced as a bogus match.
+ * summary, and with `showContents` the injected conclusions as bullets. The
+ * stable profile block is intentionally omitted here — it lives in the injection
+ * log, not in every turn's transcript. `matched` is only set for high-signal
+ * topics, so a low-signal fuzzy fallback query is never surfaced as a bogus
+ * match.
  */
 export function visInjectionMessage(hookName: string, opts: {
   conclusions: string[];
   matched?: string[];
   /** Overrides the matched suffix, e.g. "prompt" → "(query: prompt)". */
   queryLabel?: string;
+  /** Print the conclusions, not just the count. */
+  showContents?: boolean;
 }): string {
   const count = opts.conclusions.length;
   const noun = count === 1 ? "conclusion" : "conclusions";
@@ -70,8 +73,43 @@ export function visInjectionMessage(hookName: string, opts: {
       ? `injected ${count} ${noun} (matched: ${opts.matched.join(", ")})`
       : `injected ${count} ${noun}`;
   const summary = formatLine("in", hookName, head);
+  if (!opts.showContents) return summary;
   const body = opts.conclusions.map(c => `  ${sym.bullet} ${c}`).join("\n");
   return body ? `${summary}\n${body}` : summary;
+}
+
+/**
+ * Build the per-turn systemMessage for the "dialectic" component: a status line
+ * (tier · elapsed), and with `showContents` the full reasoned answer, so the
+ * user sees exactly what was injected. The answer is prose and can be long —
+ * that's the trade-off for showing it; it lands in additionalContext for the
+ * model either way.
+ */
+export function visDialecticMessage(hookName: string, reasoning: string, elapsedMs: number, answer: string, showContents = false): string {
+  const head = formatLine("in", hookName, `injected dialectic (${reasoning} · ${(elapsedMs / 1000).toFixed(1)}s)`);
+  return showContents && answer.trim() ? `${head}\n${answer.trim()}` : head;
+}
+
+/**
+ * Build the per-turn systemMessage for the "sessionContext" component: a
+ * status line with the message and token counts, and with `showContents` every
+ * injected message as a bullet. Each message is collapsed to a single truncated
+ * line — the full text goes to additionalContext; this listing is for
+ * visibility into what was injected. The count has no display cutoff: it's
+ * bounded upstream by the sessionContextTokens budget passed to
+ * session.context().
+ */
+export function visSessionContextMessage(hookName: string, lines: string[], tokenCount: number, showContents = false): string {
+  const noun = lines.length === 1 ? "message" : "messages";
+  const head = formatLine("in", hookName, `injected ${lines.length} session ${noun} (~${tokenCount} tokens)`);
+  if (!showContents) return head;
+  const body = lines
+    .map((l) => {
+      const flat = l.replace(/\s+/g, " ").trim();
+      return `  ${sym.bullet} ${flat.length > 150 ? `${flat.slice(0, 149)}…` : flat}`;
+    })
+    .join("\n");
+  return body ? `${head}\n${body}` : head;
 }
 
 /**

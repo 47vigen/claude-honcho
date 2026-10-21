@@ -1,18 +1,18 @@
-import { Honcho, Session, Peer } from "@honcho-ai/sdk";
+import { Honcho } from "@honcho-ai/sdk";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { loadConfig, getSessionName, getHonchoClientOptions, isPluginEnabled, getCachedStdin, getObservationMode, getInjectionConfig, type InjectionConfig } from "../config.js";
+import { initHook, loadConfig, getSessionName, getHonchoClientOptions, isPluginEnabled, getCachedStdin, readStdinText, getObservationMode, getInjectionConfig, type InjectionConfig, type PerTurnComponent } from "../config.js";
 import {
   getMessageCount,
   incrementMessageCount,
   getInstanceIdForCwd,
-  chunkContent,
-  addMessagesBatched,
 } from "../cache.js";
 import { logHook, logApiCall, setLogContext } from "../log.js";
-import { visInjectionMessage, visSkipMessage, addSystemMessage, verboseApiResult, verboseList } from "../visual.js";
+import { visInjectionMessage, visDialecticMessage, visSessionContextMessage, visSkipMessage, addSystemMessage, verboseApiResult, verboseList } from "../visual.js";
+import type { ReasoningLevel } from "../config.js";
 import { honchoSessionUrl } from "../styles.js";
 import { setMemoryState, setSessionLink } from "../state.js";
+import { TRIVIAL_REPLY_PATTERN, isHarnessInjected, stripLeadingReminders } from "../prompt-filters.js";
 
 interface HookInput {
   prompt?: string;
@@ -23,11 +23,27 @@ interface HookInput {
 
 // Patterns to skip context injection
 const SKIP_CONTEXT_PATTERNS = [
-  /^(yes|no|ok|sure|thanks|y|n|yep|nope|yeah|nah|continue|go ahead|do it|proceed)$/i,
+  TRIVIAL_REPLY_PATTERN,
   /^\//, // slash commands
 ];
 
 const FETCH_TIMEOUT_MS = 4000;
+// The dialectic chat() call is far slower than context() (~12s at medium, up to
+// ~120s at max reasoning), so it gets its own budget rather than the 4s context
+// race. Matched to the 120s read-path (UserPromptSubmit) hook ceiling in
+// hooks.json so the richest tiers can complete. This is a synchronous injection,
+// so the user's turn blocks for up to this long when dialectic is enabled. (The
+// prompt upload no longer runs here — it's a separate async hook — so this
+// budget is the whole hook.)
+const DIALECTIC_TIMEOUT_MS = 120000;
+
+/** Resolve a promise with its value, or null if `ms` elapses or it rejects. */
+function raceTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([
+    p.catch(() => null),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+  ]);
+}
 
 /**
  * Extract meaningful topics from a prompt for semantic search. Returns terms
@@ -109,7 +125,7 @@ export async function handleUserPrompt(): Promise<void> {
 
   let hookInput: HookInput = {};
   try {
-    const input = getCachedStdin() ?? await Bun.stdin.text();
+    const input = getCachedStdin() ?? await readStdinText();
     if (input.trim()) {
       hookInput = JSON.parse(input);
     }
@@ -131,15 +147,8 @@ export async function handleUserPrompt(): Promise<void> {
   logHook("user-prompt", `Prompt received (${prompt.length} chars)`);
   setSessionLink(honchoSessionUrl(config.workspace, sessionName), sessionName, hookInput.session_id);
 
-  // Upload the prompt immediately, concurrent with context retrieval and
-  // awaited before each exit. Log-and-drop on failure, like stop.ts.
-  let uploadPromise: Promise<void> = Promise.resolve();
-  if (config.saveMessages !== false) {
-    uploadPromise = postUserMessage(config, prompt, instanceId || undefined, sessionName)
-      .catch((e) => {
-        logHook("user-prompt", `Immediate upload failed: ${e}`);
-      });
-  }
+  // The prompt upload runs as a separate async hook (save-user-message.ts) so
+  // the write never blocks this turn's injection. This hook is read-only.
 
   // Track message count for threshold-based refresh
   const messageCountBefore = getMessageCount();
@@ -167,97 +176,148 @@ export async function handleUserPrompt(): Promise<void> {
         ? formatSessionLink(honchoSessionUrl(config.workspace, sessionName))
         : undefined;
 
-  // Skip trivial prompts — no context needed for "y", "ok", etc.
-  if (shouldSkipContextRetrieval(prompt)) {
-    logHook("user-prompt", "Skipping context (trivial prompt)");
-    visSkipMessage("user-prompt", sessionLink ? `${sessionLink} · trivial prompt` : "trivial prompt");
-    await uploadPromise;
+  // Skip trivial prompts — no context needed for "y", "ok", etc. Harness-injected
+  // turns are excluded from storage; don't use them as retrieval queries either.
+  const userPrompt = stripLeadingReminders(prompt);
+  if (isHarnessInjected(prompt) || shouldSkipContextRetrieval(userPrompt)) {
+    logHook("user-prompt", "Skipping context (harness-injected or trivial prompt)");
+    visSkipMessage("user-prompt", sessionLink ? `${sessionLink} · skipped` : "skipped");
     process.exit(0);
   }
 
   const injection = getInjectionConfig(config);
-  const wantContext = injection.perTurn.includes("context");
+  const wantUserContext = injection.perTurn.includes("userContext");
+  const wantAssistantContext = injection.perTurn.includes("assistantContext");
+  const wantSessionContext = injection.perTurn.includes("sessionContext");
+  const wantDialectic = injection.perTurn.includes("dialectic");
 
-  if (!wantContext) {
+  if (!wantUserContext && !wantAssistantContext && !wantSessionContext && !wantDialectic) {
     logHook("user-prompt", "No per-turn injection components selected");
     visSkipMessage("user-prompt", sessionLink ? `${sessionLink} · injection off` : "injection off");
-    await uploadPromise;
     process.exit(0);
   }
 
   setMemoryState("recalling", undefined, hookInput.session_id);
 
-  const fetchResult = await Promise.race([
-    fetchFreshContext(config, prompt, injection).then(r => ({ ok: true as const, ...r })),
-    new Promise<{ ok: false }>(resolve => setTimeout(() => resolve({ ok: false }), FETCH_TIMEOUT_MS)),
-  ]).catch((): { ok: false } => ({ ok: false }));
+  // All components run concurrently on independent budgets: the context fetches
+  // each on the tight 4s race, dialectic on its own budget. None blocks another,
+  // and the hook completes as soon as the slowest selected component resolves or
+  // times out.
+  const [userCtxResult, assistantCtxResult, sessionCtx, dialectic] = await Promise.all([
+    wantUserContext ? raceTimeout(fetchUserContext(config, userPrompt, injection), FETCH_TIMEOUT_MS) : Promise.resolve(null),
+    wantAssistantContext ? raceTimeout(fetchAssistantContext(config, userPrompt, injection), FETCH_TIMEOUT_MS) : Promise.resolve(null),
+    wantSessionContext ? raceTimeout(fetchSessionContext(config, sessionName, injection), FETCH_TIMEOUT_MS) : Promise.resolve(null),
+    wantDialectic ? raceTimeout(fetchDialectic(config, userPrompt, injection), DIALECTIC_TIMEOUT_MS) : Promise.resolve(null),
+  ]);
 
-  const ctx: { context: any; matched?: string[]; queryLabel?: string } | null =
-    fetchResult.ok && fetchResult.context
-      ? { context: fetchResult.context, matched: fetchResult.matched, queryLabel: fetchResult.queryLabel }
+  const userCtx: { context: any; matched?: string[]; queryLabel?: string } | null =
+    userCtxResult?.context
+      ? { context: userCtxResult.context, matched: userCtxResult.matched, queryLabel: userCtxResult.queryLabel }
       : null;
 
-  emitPerTurn(config.peerName, ctx, sessionLink);
-  await uploadPromise;
+  emitPerTurn(config, injection, userCtx, assistantCtxResult?.context ?? null, sessionCtx, dialectic, sessionLink);
   process.exit(0);
 }
 
-
-// Upload a user prompt. SessionStart already created the session/peers
-
-async function postUserMessage(
+/**
+ * Emit the per-turn injection: the selected components composed into one
+ * additionalContext payload plus a per-component systemMessage summary. Every
+ * component reports a one-line summary; only those listed in
+ * `injection.showContents` also print their payload to the terminal. Exits
+ * silently when nothing resolved to content — mirroring the old no-cache
+ * fall-through.
+ */
+function emitPerTurn(
   config: any,
-  prompt: string,
-  instanceId: string | undefined,
-  sessionName: string,
-): Promise<void> {
+  injection: InjectionConfig,
+  userCtx: { context: any; matched?: string[]; queryLabel?: string } | null,
+  assistantCtx: any | null,
+  sessionCtx: SessionContextResult | null,
+  dialectic: DialecticResult | null,
+  sessionLink?: string,
+): void {
+  const parts: string[] = [];
+  const visLines: string[] = [];
+  const show = (c: PerTurnComponent) => injection.showContents?.includes(c) ?? false;
+
+  if (userCtx) {
+    const conclusions = extractConclusions(userCtx.context);
+    if (conclusions.length > 0) {
+      parts.push(`Relevant conclusions: ${conclusions.join("; ")}`);
+      visLines.push(visInjectionMessage("user-prompt", { conclusions, matched: userCtx.matched, queryLabel: userCtx.queryLabel, showContents: show("userContext") }));
+    }
+  }
+
+  if (assistantCtx) {
+    const conclusions = extractConclusions(assistantCtx);
+    if (conclusions.length > 0) {
+      parts.push(`Conclusions about the assistant (${config.aiPeer}): ${conclusions.join("; ")}`);
+      visLines.push(visInjectionMessage("user-prompt", { conclusions, queryLabel: `assistant ${config.aiPeer}`, showContents: show("assistantContext") }));
+    }
+  }
+
+  if (sessionCtx) {
+    parts.push(`Recent Honcho session messages:\n${sessionCtx.lines.join("\n")}`);
+    visLines.push(visSessionContextMessage("user-prompt", sessionCtx.lines, sessionCtx.tokenCount, show("sessionContext")));
+  }
+
+  if (dialectic) {
+    parts.push(`Dialectic recall: ${dialectic.answer}`);
+    visLines.push(visDialecticMessage("user-prompt", dialectic.reasoning, dialectic.elapsedMs, dialectic.answer, show("dialectic")));
+  }
+
+  if (parts.length === 0) return;
+
+  const visMsg = visLines.join("\n");
+  outputContext(config.peerName, parts, sessionLink ? `${sessionLink}\n${visMsg}` : visMsg);
+}
+
+interface DialecticResult {
+  answer: string;
+  reasoning: ReasoningLevel;
+  elapsedMs: number;
+}
+
+/**
+ * Per-turn "dialectic" component: a reasoned peer.chat() answer over the peer's
+ * representation, seeded from `dialecticTemplate` (the prompt substituted into
+ * %{user_query}). Unscoped by session so recall spans the peer's full history,
+ * not just this conversation. Returns null on empty/failed answer.
+ */
+async function fetchDialectic(config: any, prompt: string, injection: InjectionConfig): Promise<DialecticResult | null> {
   const honcho = new Honcho(getHonchoClientOptions(config));
-  const noEnsure = () => Promise.resolve();
+  const observationMode = getObservationMode(config);
 
-  const userPeer = new Peer(config.peerName, honcho.workspaceId, honcho.http, undefined, undefined, noEnsure);
-  const createdAt = new Date().toISOString();
-  const messages = chunkContent(prompt).map((chunk) =>
-    userPeer.message(chunk, {
-      createdAt,
-      metadata: {
-        instance_id: instanceId || undefined,
-        session_affinity: sessionName,
-      },
-    })
-  );
+  // unified: query the user peer directly; directional: the ai peer about the user.
+  const dialecticPeer = observationMode === "unified"
+    ? await honcho.peer(config.peerName)
+    : await honcho.peer(config.aiPeer);
+  const target = observationMode === "unified" ? undefined : config.peerName;
 
-  logApiCall("session.addMessages", "POST", `user prompt (${prompt.length} chars, ${messages.length} msg, direct)`);
+  const reasoning = (injection.dialecticReasoning ?? "low") as ReasoningLevel;
+  const query = (injection.dialecticTemplate ?? "%{user_query}").replace(/%\{user_query\}/g, prompt);
+  const startTime = Date.now();
+
   try {
-    const session = new Session(sessionName, honcho.workspaceId, honcho.http, undefined, undefined, noEnsure);
-    await addMessagesBatched(session, messages);
+    const answer = await dialecticPeer.chat(query, {
+      ...(target ? { target } : {}),
+      reasoningLevel: reasoning,
+    });
+    const elapsedMs = Date.now() - startTime;
+    logApiCall("peer.chat (dialectic)", "POST", `${reasoning}: ${query.slice(0, 60)}`, elapsedMs, true);
+    if (typeof answer !== "string" || !answer.trim()) return null;
+    return { answer: answer.trim(), reasoning, elapsedMs };
   } catch (e) {
-    logHook("user-prompt", `Direct upload failed, retrying via get-or-create: ${e}`);
-    const session = await honcho.session(sessionName);
-    await addMessagesBatched(session, messages);
+    logHook("user-prompt", `Dialectic fetch failed: ${e}`);
+    return null;
   }
 }
 
 /**
- * Emit the per-turn "context" injection: the cache/fresh/stale context blob
- * formatted into additionalContext plus its systemMessage. Exits silently when
- * nothing resolved — mirroring the old no-cache fall-through.
+ * Per-turn "userContext" component: a prompt-scoped peer.context() fetch for
+ * the user peer, observation-mode aware.
  */
-function emitPerTurn(
-  peerName: string,
-  ctx: { context: any; matched?: string[]; queryLabel?: string } | null,
-  sessionLink?: string,
-): void {
-  if (!ctx) return;
-
-  const conclusions = extractConclusions(ctx.context);
-  if (conclusions.length === 0) return;
-
-  const parts = [`Relevant conclusions: ${conclusions.join("; ")}`];
-  const visMsg = visInjectionMessage("user-prompt", { conclusions, matched: ctx.matched, queryLabel: ctx.queryLabel });
-  outputContext(peerName, parts, sessionLink ? `${sessionLink}\n${visMsg}` : visMsg);
-}
-
-async function fetchFreshContext(config: any, prompt: string, injection: InjectionConfig): Promise<{ context: any; matched: string[]; queryLabel?: string }> {
+async function fetchUserContext(config: any, prompt: string, injection: InjectionConfig): Promise<{ context: any; matched: string[]; queryLabel?: string }> {
   const honcho = new Honcho(getHonchoClientOptions(config));
   const observationMode = getObservationMode(config);
 
@@ -309,6 +369,76 @@ async function fetchFreshContext(config: any, prompt: string, injection: Injecti
   return { context: contextResult, matched, queryLabel: usePrompt ? "prompt" : undefined };
 }
 
+/**
+ * Per-turn "assistantContext" component: the same prompt-scoped peer.context()
+ * fetch, but for the AI peer's own representation — what Honcho has derived
+ * about the assistant. Always the peer's global (self) view, regardless of
+ * observation mode: there is no directional "assistant observed by user"
+ * collection to fall back to.
+ */
+async function fetchAssistantContext(config: any, prompt: string, injection: InjectionConfig): Promise<{ context: any } | null> {
+  const honcho = new Honcho(getHonchoClientOptions(config));
+  const aiPeer = await honcho.peer(config.aiPeer);
+
+  const usePrompt = injection.searchQuerySource === "prompt";
+  const { topics } = usePrompt ? { topics: [] } : extractTopics(prompt);
+  const searchQuery = usePrompt || topics.length === 0 ? prompt : topics.join(" ");
+
+  const startTime = Date.now();
+  try {
+    const context = await aiPeer.context({
+      searchQuery,
+      searchTopK: injection.searchTopK,
+      searchMaxDistance: injection.searchMaxDistance,
+      maxConclusions: injection.maxConclusions,
+      includeMostFrequent: false,
+    });
+    logApiCall("aiPeer.context (assistant)", "GET", `search: ${searchQuery.slice(0, 60)}`, Date.now() - startTime, true);
+    verboseApiResult("aiPeer.context() -> representation (assistant)", (context as any)?.representation);
+    return { context };
+  } catch (e) {
+    logHook("user-prompt", `Assistant context fetch failed: ${e}`);
+    return null;
+  }
+}
+
+interface SessionContextResult {
+  /** "peer: content" lines, oldest first. */
+  lines: string[];
+  tokenCount: number;
+}
+
+/**
+ * Per-turn "sessionContext" component: recent raw messages from the currently
+ * mapped Honcho session, within a token budget. Summary is off — it's the same
+ * stored row the sessionStart "summary" component injects — and no peer target
+ * or search query is passed, keeping this a plain message-window fetch rather
+ * than another semantic retrieval. The value is turns from other instances
+ * sharing the session name (per-directory strategy). Returns null when the
+ * session has no messages.
+ */
+async function fetchSessionContext(config: any, sessionName: string, injection: InjectionConfig): Promise<SessionContextResult | null> {
+  const honcho = new Honcho(getHonchoClientOptions(config));
+  const startTime = Date.now();
+  try {
+    const session = await honcho.session(sessionName);
+    const context = await session.context({
+      summary: false,
+      tokens: injection.sessionContextTokens ?? 1500,
+    });
+    logApiCall("session.context", "GET", sessionName, Date.now() - startTime, true);
+    const messages = context?.messages ?? [];
+    if (!messages.length) return null;
+    const lines = messages.map((m: any) => `${m.peerId}: ${m.content}`);
+    const tokenCount = messages.reduce((sum: number, m: any) => sum + (m.tokenCount ?? 0), 0);
+    verboseApiResult("session.context() -> messages", lines.join("\n"));
+    return { lines, tokenCount };
+  } catch (e) {
+    logHook("user-prompt", `Session context fetch failed: ${e}`);
+    return null;
+  }
+}
+
 // Per-turn context injects representation-derived conclusions ONLY. The full
 // peer card is stable identity and belongs to the SessionStart surface (the
 // "peerCard" component) — re-sending its 40+ items every turn was a recurring
@@ -342,4 +472,10 @@ function outputContext(peerName: string, contextParts: string[], systemMsg?: str
     output = addSystemMessage(output, systemMsg);
   }
   console.log(JSON.stringify(output));
+}
+
+/** Entry point: reads stdin once, then runs the handler. */
+export async function main(): Promise<void> {
+  await initHook();
+  await handleUserPrompt();
 }

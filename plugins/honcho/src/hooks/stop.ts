@@ -1,9 +1,10 @@
 import { Honcho, Session, Peer } from "@honcho-ai/sdk";
-import { loadConfig, getSessionForPath, getSessionName, getHonchoClientOptions, isPluginEnabled, getCachedStdin } from "../config.js";
+import { initHook, loadConfig, getSessionForPath, getSessionName, getHonchoClientOptions, isPluginEnabled, isLoggingEnabled, getCachedStdin, readStdinText } from "../config.js";
 import { existsSync, readFileSync } from "fs";
 import { getInstanceIdForCwd, chunkContent, addMessagesBatched } from "../cache.js";
 import { logHook, logApiCall, setLogContext } from "../log.js";
 import { visStopMessage } from "../visual.js";
+import { isSlashCommand, stripLeadingReminders } from "../prompt-filters.js";
 
 interface HookInput {
   session_id?: string;
@@ -11,6 +12,7 @@ interface HookInput {
   cwd?: string;
   stop_hook_active?: boolean;
   workspace_roots?: string[];
+  last_assistant_message?: string;
 }
 
 interface TranscriptEntry {
@@ -18,6 +20,8 @@ interface TranscriptEntry {
   role?: string;
   timestamp?: string;
   isMeta?: boolean;
+  promptSource?: string;
+  origin?: { kind?: string };
   message?: {
     role?: string;
     content: string | Array<{ type: string; text?: string; name?: string; input?: any }>;
@@ -25,18 +29,31 @@ interface TranscriptEntry {
   content?: string | Array<{ type: string; text?: string }>;
 }
 
+/** System-injected wakeup (task notification etc.). Not a real prompt, but the Stop
+ *  hook already fired for everything before it, so it ends the previous segment. */
+function isWakeupBoundary(entry: TranscriptEntry): boolean {
+  return entry.promptSource === "system" || entry.origin?.kind === "task-notification";
+}
+
+function userText(entry: TranscriptEntry): string {
+  const mc = entry.message?.content ?? entry.content;
+  if (typeof mc === "string") return mc;
+  if (Array.isArray(mc)) return mc.filter((b) => b.type === "text" && b.text).map((b) => b.text!).join("");
+  return "";
+}
+
 /** True for a real user-typed prompt. Excludes tool_results, isMeta entries, and `<...>` command caveats. */
 function isRealUserPrompt(entry: TranscriptEntry): boolean {
   if (entry.isMeta) return false;
-  const mc = entry.message?.content ?? entry.content;
-  const text =
-    typeof mc === "string"
-      ? mc
-      : Array.isArray(mc)
-        ? mc.filter((b) => b.type === "text" && b.text).map((b) => b.text!).join("")
-        : "";
-  const trimmed = text.trim();
+  const trimmed = stripLeadingReminders(userText(entry)).trim();
   return trimmed.length > 0 && !trimmed.startsWith("<");
+}
+
+/** Typed slash command or skill invocation. Not prompt text to upload, but it starts
+ *  a turn, so the previous turn's reply must not be collected again. Model-invoked
+ *  skills record the same tags with isMeta set and stay inside the current turn. */
+function isSlashCommandBoundary(entry: TranscriptEntry): boolean {
+  return !entry.isMeta && isSlashCommand(userText(entry));
 }
 
 function assistantText(entry: TranscriptEntry): string {
@@ -48,8 +65,20 @@ function assistantText(entry: TranscriptEntry): string {
   return "";
 }
 
-/** Assistant text blocks since the last real user prompt (the just-completed turn). */
-function getCurrentTurnAssistantMessages(transcriptPath: string): Array<{ text: string; timestamp?: string }> {
+type TurnBlock = { text: string; timestamp?: string };
+
+/** Assistant text blocks of the just-completed segment: everything since the last
+ *  real user prompt, slash command, or wakeup boundary. Wakeup firings would otherwise re-collect
+ *  the whole accumulated turn, duplicating blocks already uploaded. Stop can fire
+ *  before the final assistant entry is flushed, so the payload's copy of it fills in. */
+export function getCurrentTurnAssistantMessages(transcriptPath: string, lastAssistantMessage?: string): TurnBlock[] {
+  const blocks = readTranscriptTurnBlocks(transcriptPath);
+  const last = lastAssistantMessage?.trim();
+  if (last && blocks[blocks.length - 1]?.text.trim() !== last) blocks.push({ text: last });
+  return blocks;
+}
+
+function readTranscriptTurnBlocks(transcriptPath: string): TurnBlock[] {
   if (!transcriptPath || !existsSync(transcriptPath)) return [];
 
   let lines: string[];
@@ -59,12 +88,15 @@ function getCurrentTurnAssistantMessages(transcriptPath: string): Array<{ text: 
     return [];
   }
 
-  // Walk back to the last real user prompt — the start of the current turn.
+  // Walk back to the last real user prompt, slash command, or wakeup — the start of the current segment.
   let lastPromptIdx = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
       const entry: TranscriptEntry = JSON.parse(lines[i]);
-      if ((entry.type || entry.role) === "user" && isRealUserPrompt(entry)) {
+      if (
+        (entry.type || entry.role) === "user" &&
+        (isRealUserPrompt(entry) || isSlashCommandBoundary(entry) || isWakeupBoundary(entry))
+      ) {
         lastPromptIdx = i;
         break;
       }
@@ -75,7 +107,7 @@ function getCurrentTurnAssistantMessages(transcriptPath: string): Array<{ text: 
   // return nothing if there's no last prompt
   if (lastPromptIdx === -1) return [];
 
-  const blocks: Array<{ text: string; timestamp?: string }> = [];
+  const blocks: TurnBlock[] = [];
   for (let i = lastPromptIdx + 1; i < lines.length; i++) {
     try {
       const entry: TranscriptEntry = JSON.parse(lines[i]);
@@ -107,7 +139,7 @@ export async function handleStop(): Promise<void> {
 
   let hookInput: HookInput = {};
   try {
-    const input = getCachedStdin() ?? await Bun.stdin.text();
+    const input = getCachedStdin() ?? await readStdinText();
     if (input.trim()) {
       hookInput = JSON.parse(input);
     }
@@ -129,7 +161,7 @@ export async function handleStop(): Promise<void> {
   // Set log context
   setLogContext(cwd, sessionName);
 
-  const turnMessages = getCurrentTurnAssistantMessages(transcriptPath || "");
+  const turnMessages = getCurrentTurnAssistantMessages(transcriptPath || "", hookInput.last_assistant_message);
 
   if (turnMessages.length === 0) {
     logHook("stop", `Skipping (no assistant content this turn)`);
@@ -162,20 +194,24 @@ export async function handleStop(): Promise<void> {
     );
     logApiCall("session.addMessages", "POST", `${turnMessages.length} assistant msg(s), ${messages.length} chunk(s), direct`);
 
-    try {
-      const session = new Session(sessionName, honcho.workspaceId, honcho.http, undefined, undefined, noEnsure);
-      await addMessagesBatched(session, messages);
-    } catch (e) {
+    const session = new Session(sessionName, honcho.workspaceId, honcho.http, undefined, undefined, noEnsure);
+    await addMessagesBatched(session, messages, (e) => {
       logHook("stop", `Direct upload failed, retrying via get-or-create: ${e}`);
-      const session = await honcho.session(sessionName);
-      await addMessagesBatched(session, messages);
-    }
+      return honcho.session(sessionName);
+    });
 
     logHook("stop", `Saved ${turnMessages.length} assistant message(s)`);
-    visStopMessage("out", `saved ${turnMessages.length} assistant msg(s)`);
   } catch (error) {
     logHook("stop", `Upload failed: ${error}`, { error: String(error) });
+    const seeLog = isLoggingEnabled() ? " (see ~/.honcho/activity.log)" : "";
+    visStopMessage("warn", `upload failed, ${turnMessages.length} assistant msg(s) not saved${seeLog}`);
   }
 
   process.exit(0);
+}
+
+/** Entry point: reads stdin once, then runs the handler. */
+export async function main(): Promise<void> {
+  await initHook();
+  await handleStop();
 }
